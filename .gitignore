@@ -1,0 +1,41 @@
+# Virtual Environment
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+ENV/
+
+# Certificates and Keys (NEVER COMMIT THESE)
+certs/*.key
+certs/*.pem
+certs/*.crt
+*.pem~ 
+certs/*.key.pem
+certs/ca.key.pem
+.env
+
+
+# Environment files
+.env
+
+# Logs and Transcripts
+logs/*.log
+transcripts/*.txt
+transcripts/*.json
+
+# Database dumps (optional)
+*.sql.backup
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
