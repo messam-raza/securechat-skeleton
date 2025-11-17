@@ -1,16 +1,10 @@
 """
-app/pki.py
-Utilities to load and verify X.509 certificates issued by our local CA.
-
-Functions:
- - load_pem_cert(path) -> cryptography.x509.Certificate
- - verify_cert_against_ca(cert_pem_bytes, ca_cert_path, expected_cn=None) -> (True, None) or (False, "error message")
- - get_cert_fingerprint(cert) -> hex fingerprint (SHA256)
+app/crypto/pki.py
+Load and verify X.509 certificates.
 """
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.hazmat.primitives.asymmetric import padding
 import datetime
 
@@ -19,13 +13,12 @@ def load_pem_cert(path: str) -> x509.Certificate:
         data = f.read()
     return x509.load_pem_x509_certificate(data)
 
-def verify_cert_against_ca(peer_cert_pem: bytes, ca_cert_path: str, expected_cn: str = None, check_san_host: str = None):
-    """
-    Verify that peer_cert_pem (bytes) is signed by CA in ca_cert_path, that it is within validity,
-    and that its CN or SAN matches expected_cn/check_san_host if provided.
-
-    Returns: (True, None) on success, (False, "error message") on failure.
-    """
+def verify_cert_against_ca(
+    peer_cert_pem: bytes,
+    ca_cert_path: str,
+    expected_cn: str = None,
+    check_san_host: str = None
+):
     try:
         ca_cert = load_pem_cert(ca_cert_path)
     except Exception as e:
@@ -36,7 +29,7 @@ def verify_cert_against_ca(peer_cert_pem: bytes, ca_cert_path: str, expected_cn:
     except Exception as e:
         return False, f"PEER_CERT_PARSE_FAIL: {e}"
 
-    # 1) Verify signature - confirms CA signed the certificate
+    # 1. Verify CA signature
     try:
         ca_public_key = ca_cert.public_key()
         ca_public_key.verify(
@@ -46,38 +39,39 @@ def verify_cert_against_ca(peer_cert_pem: bytes, ca_cert_path: str, expected_cn:
             peer_cert.signature_hash_algorithm,
         )
     except Exception as e:
-        return False, f"BAD CERT: signature verification failed ({e})"
+        return False, f"BAD_CERT: signature failed ({e})"
 
-    # 2) Check validity dates
+    # 2. Check validity
     now = datetime.datetime.utcnow()
-    if now < peer_cert.not_valid_before:
-        return False, f"BAD CERT: not valid yet (valid_from={peer_cert.not_valid_before})"
-    if now > peer_cert.not_valid_after:
-        return False, f"BAD CERT: expired (valid_to={peer_cert.not_valid_after})"
+    try:
+        if now.replace(tzinfo=None) < peer_cert.not_valid_before:
+            return False, f"BAD_CERT: not valid yet ({peer_cert.not_valid_before})"
+        if now.replace(tzinfo=None) > peer_cert.not_valid_after:
+            return False, f"BAD_CERT: expired ({peer_cert.not_valid_after})"
+    except Exception as e:
+        return False, f"TIME_CHECK_FAIL: {e}"
 
-    # 3) Check CN if given
+    # 3. Check CN
     if expected_cn:
         try:
-            cn_attr = peer_cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)[0]
-            cn = cn_attr.value
+            cn = peer_cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
             if cn != expected_cn:
-                return False, f"BAD CERT: CN mismatch (expected {expected_cn}, got {cn})"
+                return False, f"CN_MISMATCH: expected {expected_cn}, got {cn}"
         except Exception:
-            return False, "BAD CERT: CN missing or unreadable"
+            return False, "CN_MISSING"
 
-    # 4) Check SAN against host if provided
+    # 4. Check SAN
     if check_san_host:
         try:
-            san_ext = peer_cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-            dns_names = san_ext.get_values_for_type(x509.DNSName)
-            ip_names = [str(x) for x in san_ext.get_values_for_type(x509.IPAddress)]
-            if check_san_host not in dns_names and check_san_host not in ip_names:
-                return False, f"BAD CERT: SAN does not contain {check_san_host}"
+            san = peer_cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+            dns = san.get_values_for_type(x509.DNSName)
+            ips = [str(ip) for ip in san.get_values_for_type(x509.IPAddress)]
+            if check_san_host not in dns and check_san_host not in ips:
+                return False, f"SAN_MISSING: {check_san_host}"
         except x509.ExtensionNotFound:
-            return False, "BAD CERT: SAN extension missing"
+            return False, "SAN_EXTENSION_MISSING"
 
     return True, None
 
 def get_cert_fingerprint(cert: x509.Certificate) -> str:
-    digest = cert.fingerprint(hashes.SHA256())
-    return digest.hex()
+    return cert.fingerprint(hashes.SHA256()).hex()
