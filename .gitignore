@@ -39,3 +39,17 @@ transcripts/*.json
 # OS
 .DS_Store
 Thumbs.db
+
+
+__pycache__/
+*.pyc
+instance/
+.env
+.vscode/
+venv/
+app/__pycache__/
+app/storage/__pycache__/
+app/common/__pycache__/
+app/crypto/__pycache__/
+transcripts/
+certs

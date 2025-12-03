@@ -1,380 +1,539 @@
-#!/usr/bin/env python3
+"""Server skeleton — plain TCP; no TLS. See assignment spec."""
+
 """
-SecureChat Server – FULLY WORKING (Register → Login → Chat → Receipt)
-All Pydantic models include the required 'type' field explicitly.
-Ephemeral key binds to certificate fingerprints.
+Secure Chat Server
+Implements the server-side of the secure chat protocol with full CIANR guarantees.
 """
 
-import os, sys, socket, json, base64, hashlib, time
-from dotenv import load_dotenv
-load_dotenv()
+import socket
+import sys
+import os
+import json
 
-# Crypto
-from app.crypto.pki import verify_cert_against_ca, load_pem_cert
-from app.crypto.dh import get_group, gen_keypair, compute_shared, derive_key_from_shared
-from app.crypto.aes_util import aes_encrypt, aes_decrypt
-from app.crypto.sign import sign_data, verify_signature, load_rsa_private
-from app.storage.transcript import TranscriptLogger
+# Add parent directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-# DB
-import pymysql
-import secrets
+from app.crypto.pki import PKIManager
+from app.crypto.dh import DHKeyExchange
+from app.crypto.aes import AESCipher
+from app.crypto.sign import SignatureManager
+from app.storage.db import DatabaseManager
+from app.storage.transcript import TranscriptLogger, create_transcript_path
+from app.common.protocol import ProtocolMessage
+from app.common.utils import (
+    generate_nonce, send_message, receive_message,
+    print_banner, b64e, b64d
+)
 
-# Common helpers & protocol models
-from app.common.utils import b64e, b64d, sha256_hex
-from app.common.protocol import *
 
-# --------------------------------------------------------------------------- #
-# -------------------------------- CONFIG ----------------------------------- #
-# --------------------------------------------------------------------------- #
-
-HOST            = os.getenv("SERVER_HOST", "127.0.0.1")
-PORT            = int(os.getenv("SERVER_PORT", "9999"))
-CA_CERT         = os.getenv("CA_CERT_PATH", "certs/ca.cert.pem")
-SERVER_CERT     = os.getenv("SERVER_CERT_PATH", "certs/server.cert.pem")
-SERVER_KEY      = os.getenv("SERVER_KEY_PATH", "certs/server.key.pem")
-
-DB_HOST         = os.getenv("DB_HOST", "127.0.0.1")
-DB_PORT         = int(os.getenv("DB_PORT", "3306"))
-DB_USER         = os.getenv("DB_USER", "securechat_user")
-DB_PASS         = os.getenv("DB_PASS", "")
-DB_NAME         = os.getenv("DB_NAME", "securechat_db")
-
-TRANSCRIPTS_DIR = os.getenv("TRANSCRIPTS_DIR", "transcripts")
-
-# --------------------------------------------------------------------------- #
-# ------------------------------- DB HELPERS -------------------------------- #
-# --------------------------------------------------------------------------- #
-
-def connect_db():
-    return pymysql.connect(
-        host=DB_HOST, port=DB_PORT, user=DB_USER,
-        password=DB_PASS, db=DB_NAME, autocommit=True,
-        cursorclass=pymysql.cursors.Cursor
-    )
-
-def user_exists(conn, username, email):
-    with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM users WHERE username=%s OR email=%s LIMIT 1", (username, email))
-        return cur.fetchone() is not None
-
-def store_user(conn, email, username, salt_bytes, pwd_hash_hex):
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO users (email, username, salt, pwd_hash) VALUES (%s,%s,%s,%s)",
-            (email, username, salt_bytes, pwd_hash_hex)
+class SecureChatServer:
+    """Secure chat server implementation."""
+    
+    def __init__(self, host='127.0.0.1', port=5000):
+        """Initialize server."""
+        self.host = host
+        self.port = port
+        self.socket = None
+        self.client_socket = None
+        
+        # PKI
+        self.pki = PKIManager(
+            'certs/ca_cert.pem',
+            'certs/server_cert.pem',
+            'certs/server_private_key.pem'
         )
-
-def fetch_user(conn, email):
-    with conn.cursor() as cur:
-        cur.execute("SELECT salt, pwd_hash FROM users WHERE email=%s LIMIT 1", (email,))
-        return cur.fetchone()
-
-# --------------------------------------------------------------------------- #
-# ----------------------------- JSON I/O ------------------------------------ #
-# --------------------------------------------------------------------------- #
-
-def send_json(sock, obj):
-    data = json.dumps(obj.model_dump() if hasattr(obj, "model_dump") else obj).encode()
-    sock.sendall(len(data).to_bytes(4, "big") + data)
-
-def recv_json(sock):
-    try:
-        length_bytes = sock.recv(4)
-        if not length_bytes:
-            return None
-        length = int.from_bytes(length_bytes, "big")
-        data = b""
-        while len(data) < length:
-            chunk = sock.recv(length - len(data))
-            if not chunk:
-                break
-            data += chunk
-        return json.loads(data.decode())
-    except Exception:
-        return None
-
-# --------------------------------------------------------------------------- #
-# ------------------------ CERTIFICATE EXCHANGE ----------------------------- #
-# --------------------------------------------------------------------------- #
-
-def exchange_and_verify_certs(sock):
-    # Send server hello with type
-    with open(SERVER_CERT, "rb") as f:
-        my_cert = f.read()
-    send_json(sock, ServerHello(type="server hello", server_cert=my_cert.decode()))
-
-    # Receive client hello
-    msg = recv_json(sock)
-    if not msg:
-        raise RuntimeError("Connection closed before client hello")
-    try:
-        hello = Hello(**msg)
-    except Exception as e:
-        raise RuntimeError(f"Invalid client hello: {e}")
-
-    client_cert_pem = hello.client_cert.encode()
-
-    # Verify client cert
-    ok, err = verify_cert_against_ca(client_cert_pem, CA_CERT, expected_cn="client")
-    if not ok:
-        raise RuntimeError(f"BAD CLIENT CERT: {err}")
-
-    print("[+] Client certificate validated")
-    return client_cert_pem
-
-# --------------------------------------------------------------------------- #
-# -------------------------- EPHEMERAL DH (Phase 4) -------------------------- #
-# --------------------------------------------------------------------------- #
-
-def perform_dh(sock, client_cert_pem):
-    dh_msg = recv_json(sock)
-    if not dh_msg:
-        raise RuntimeError("Connection closed during DH")
-    try:
-        dh_client = DHClient(**dh_msg)
-    except Exception as e:
-        raise RuntimeError(f"Invalid DH client: {e}")
-
-    p, g, A = int(dh_client.p), int(dh_client.g), int(dh_client.A)
-    b, B = gen_keypair(p, g)
-
-    # Send B
-    send_json(sock, DHServer(type="dh server", B=str(B)))
-
-    # Compute shared secret
-    shared = compute_shared(b, A, p)
-    base_key = derive_key_from_shared(shared)
-
-    # Bind to certificate fingerprints
-    client_fp = sha256_hex(load_pem_cert(client_cert_pem).public_bytes(serialization.Encoding.DER))
-    server_fp = sha256_hex(load_pem_cert(SERVER_CERT).public_bytes(serialization.Encoding.DER))
-    key_material = f"{base_key.hex()}:{client_fp}:{server_fp}".encode()
-    aes_key = hashlib.sha256(key_material).digest()[:16]
-
-    print("[+] Ephemeral AES key derived (with cert binding)")
-    return aes_key
-
-# --------------------------------------------------------------------------- #
-# -------------------------- REGISTRATION / LOGIN --------------------------- #
-# --------------------------------------------------------------------------- #
-
-def handle_register(sock, aes_key, db_conn):
-    msg = recv_json(sock)
-    if not msg or msg.get("type") != "register":
-        send_json(sock, Error(type="error", msg="expected register"))
-        return
-    try:
-        reg = Register(**msg)
-    except:
-        send_json(sock, Error(type="error", msg="invalid register"))
-        return
-
-    iv = b64d(reg.iv)
-    ct = b64d(reg.ct)
-    try:
-        pt = aes_decrypt(aes_key, iv, ct)
-        payload = json.loads(pt.decode())
-        email = payload["email"]
-        username = payload["username"]
-        password = payload["password"]
-    except:
-        send_json(sock, Error(type="error", msg="decrypt failed"))
-        return
-
-    if user_exists(db_conn, username, email):
-        send_json(sock, {"status": "error", "msg": "user exists"})
-        return
-
-    salt = secrets.token_bytes(16)
-    pwd_hash = hashlib.sha256(salt + password.encode()).hexdigest()
-    store_user(db_conn, email, username, salt, pwd_hash)
-    send_json(sock, {"status": "ok", "msg": "registered"})
-    print(f"[+] Registered: {email}")
-
-def handle_login(sock, aes_key, db_conn):
-    msg = recv_json(sock)
-    if not msg or msg.get("type") != "login":
-        send_json(sock, Error(type="error", msg="expected login"))
-        return None
-    try:
-        login = Login(**msg)
-    except:
-        send_json(sock, Error(type="error", msg="invalid login"))
-        return None
-
-    iv = b64d(login.iv)
-    ct = b64d(login.ct)
-    try:
-        pt = aes_decrypt(aes_key, iv, ct)
-        payload = json.loads(pt.decode())
-        email = payload["email"]
-        password = payload["password"]
-    except:
-        send_json(sock, Error(type="error", msg="decrypt failed"))
-        return None
-
-    row = fetch_user(db_conn, email)
-    if not row:
-        send_json(sock, {"status": "error", "msg": "invalid creds"})
-        return None
-
-    salt, stored_hash = row
-    computed = hashlib.sha256(salt + password.encode()).hexdigest()
-    if computed != stored_hash:
-        send_json(sock, {"status": "error", "msg": "invalid creds"})
-        return None
-
-    send_json(sock, {"status": "ok", "msg": "logged in"})
-    print(f"[+] Login: {email}")
-    return email
-
-# --------------------------------------------------------------------------- #
-# -------------------------- SESSION DH (Phase 4) ---------------------------- #
-# --------------------------------------------------------------------------- #
-
-def session_dh(sock):
-    p, g = get_group()
-    b, B = gen_keypair(p, g)
-    send_json(sock, SessionDHServer(type="session dh server", p=str(p), g=str(g), B=str(B)))
-
-    msg = recv_json(sock)
-    if not msg:
-        raise RuntimeError("Connection closed during session DH")
-    try:
-        sess_client = SessionDHClient(**msg)
-    except Exception as e:
-        raise RuntimeError(f"Invalid session DH client: {e}")
-
-    A = int(sess_client.A)
-    shared = compute_shared(b, A, p)
-    session_key = derive_key_from_shared(shared)
-    print("[+] Session AES key derived")
-    return session_key
-
-# --------------------------------------------------------------------------- #
-# -------------------------- CHAT HANDLER (Phase 6-7) ----------------------- #
-# --------------------------------------------------------------------------- #
-
-def handle_chat(sock, session_key, client_email, client_cert_pem):
-    transcript = TranscriptLogger(client_email, TRANSCRIPTS_DIR)
-    expected_seq = 0
-    client_pub = load_pem_cert(client_cert_pem).public_key()
-    server_priv = load_rsa_private(SERVER_KEY)
-
-    print("[*] Chat session started")
-
-    while True:
-        msg = recv_json(sock)
+        
+        # Database
+        self.db = DatabaseManager(
+            host=os.getenv('DB_HOST', 'localhost'),
+            port=int(os.getenv('DB_PORT', 3306)),
+            database=os.getenv('DB_NAME', 'securechat_db'),
+            user=os.getenv('DB_USER', 'root'),
+            password=os.getenv('DB_PASSWORD', '')
+        )
+        
+        # Session state
+        self.peer_cert = None
+        self.session_key = None
+        self.cipher = None
+        self.username = None
+        self.seqno_sent = 0
+        self.seqno_received = 0
+        self.transcript = None
+    
+    def start(self):
+        """Start the server."""
+        print_banner("SecureChat Server")
+        
+        # Connect to database
+        if not self.db.connect():
+            print("[✗] Failed to connect to database")
+            return
+        
+        # Create socket
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind((self.host, self.port))
+        self.socket.listen(1)
+        
+        print(f"[*] Server listening on {self.host}:{self.port}")
+        print("[*] Waiting for client connection...")
+        
+        try:
+            self.client_socket, client_address = self.socket.accept()
+            print(f"\n[✓] Client connected from {client_address}")
+            
+            # Handle client connection
+            self.handle_client()
+            
+        except KeyboardInterrupt:
+            print("\n[*] Server shutting down...")
+        except Exception as e:
+            print(f"\n[✗] Error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.cleanup()
+    
+    def handle_client(self):
+        """Handle client connection through all protocol phases."""
+        try:
+            # Phase 1: Control Plane - Certificate Exchange & Authentication
+            if not self.handle_control_plane():
+                print("[✗] Control plane failed")
+                return
+            
+            # Phase 2: Key Agreement - Establish session key
+            if not self.handle_key_agreement():
+                print("[✗] Key agreement failed")
+                return
+            
+            print("\n[✓] Secure channel established!")
+            print(f"[✓] Authenticated user: {self.username}")
+            print("\n" + "="*60)
+            print("Chat session active. Type your messages (Ctrl+C to exit)")
+            print("="*60 + "\n")
+            
+            # Phase 3: Data Plane - Encrypted chat
+            self.handle_chat_session()
+            
+            # Phase 4: Teardown - Non-repudiation
+            self.handle_teardown()
+            
+        except Exception as e:
+            print(f"[✗] Error handling client: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def handle_control_plane(self):
+        """Handle certificate exchange and authentication."""
+        print("\n" + "="*60)
+        print("PHASE 1: Control Plane (Certificate Exchange & Authentication)")
+        print("="*60)
+        
+        # Step 1: Receive client HELLO
+        print("\n[*] Waiting for client HELLO...")
+        msg = receive_message(self.client_socket)
         if not msg:
-            break
-
-        if msg.get("type") == "chat":
-            try:
-                chat = ChatMessage(**msg)
-
-                if chat.seqno != expected_seq:
-                    send_json(sock, Error(type="error", msg="SEQNO_MISMATCH"))
-                    continue
-
-                iv = b64d(chat.iv)
-                ct = b64d(chat.ct)
-                sig = b64d(chat.sig)
-
-                pt = aes_decrypt(session_key, iv, ct)
-                payload = json.loads(pt.decode())
-                content = payload["msg"]
-
-                data_to_sign = f"{chat.seqno}{chat.ts}{content}".encode()
-                if not verify_signature(client_pub, data_to_sign, sig):
-                    send_json(sock, Error(type="error", msg="BAD_SIG"))
-                    continue
-
-                if abs(int(time.time() * 1000) - chat.ts) > 5000:
-                    send_json(sock, Error(type="error", msg="MSG_EXPIRED"))
-                    continue
-
-                transcript.log_message(chat.seqno, chat.ts, content, sig)
-                print(f"[{chat.seqno}] {client_email}: {content}")
-                expected_seq += 1
-
-            except Exception as e:
-                print("[!] Chat error:", e)
-                continue
-
-        elif msg.get("type") == "close":
-            transcript.finalize()
-
-            with open(transcript.filepath, "rb") as f:
-                transcript_bytes = f.read()
-            transcript_hash = hashlib.sha256(transcript_bytes).digest()
-            signature = sign_data(server_priv, transcript_hash)
-
-            send_json(
-                sock,
-                Receipt(
-                    type="receipt",
-                    transcript_hash=b64e(transcript_hash),
-                    signature=b64e(signature)
-                )
-            )
-            print("[*] Session closed – receipt sent")
-            break
-
+            return False
+        
+        hello_msg = ProtocolMessage.parse(msg)
+        if hello_msg['type'] != ProtocolMessage.TYPE_HELLO:
+            self.send_error("PROTOCOL_ERROR", "Expected HELLO message")
+            return False
+        
+        print("[✓] Received client HELLO")
+        
+        # Step 2: Verify client certificate
+        print("[*] Verifying client certificate...")
+        is_valid, peer_cert, error_msg = self.pki.verify_certificate(
+            hello_msg['client_cert'],
+            expected_cn='securechat.client.local'
+        )
+        
+        if not is_valid:
+            print(f"[✗] {error_msg}")
+            self.send_error("BAD_CERT", error_msg)
+            return False
+        
+        self.peer_cert = peer_cert
+        peer_info = self.pki.get_certificate_info(peer_cert)
+        print(f"[✓] Client certificate valid")
+        print(f"    CN: {peer_info['subject']}")
+        print(f"    Fingerprint: {peer_info['fingerprint'][:32]}...")
+        
+        # Step 3: Send server HELLO
+        print("[*] Sending server HELLO...")
+        server_nonce = generate_nonce()
+        server_hello = ProtocolMessage.create_server_hello(
+            self.pki.get_certificate_pem(),
+            server_nonce
+        )
+        send_message(self.client_socket, server_hello)
+        print("[✓] Server HELLO sent")
+        
+        # Step 4: Temporary DH for authentication phase
+        print("\n[*] Performing temporary DH exchange for authentication...")
+        if not self.perform_temp_dh():
+            return False
+        
+        # Step 5: Handle registration or login
+        print("\n[*] Waiting for authentication request...")
+        auth_msg_encrypted = receive_message(self.client_socket)
+        if not auth_msg_encrypted:
+            return False
+        
+        # Decrypt authentication message
+        try:
+            auth_msg_json = self.temp_cipher.decrypt_from_base64(auth_msg_encrypted)
+            auth_msg = ProtocolMessage.parse(auth_msg_json.decode('utf-8'))
+        except Exception as e:
+            print(f"[✗] Failed to decrypt auth message: {e}")
+            return False
+        
+        # Handle registration or login
+        if auth_msg['type'] == ProtocolMessage.TYPE_REGISTER:
+            success, message = self.handle_registration(auth_msg)
+        elif auth_msg['type'] == ProtocolMessage.TYPE_LOGIN:
+            success, message = self.handle_login(auth_msg)
         else:
-            send_json(sock, Error(type="error", msg="unknown message type"))
-
-# --------------------------------------------------------------------------- #
-# ------------------------------ MAIN SERVER --------------------------------- #
-# --------------------------------------------------------------------------- #
-
-def main():
-    db_conn = connect_db()
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((HOST, PORT))
-    srv.listen(5)
-    print(f"[+] Server listening on {HOST}:{PORT}")
-
-    try:
+            success = False
+            message = "Unknown authentication type"
+        
+        # Send authentication response
+        response = ProtocolMessage.create_auth_response(success, message, self.username)
+        send_message(self.client_socket, response)
+        
+        if not success:
+            print(f"[✗] Authentication failed: {message}")
+            return False
+        
+        print(f"[✓] Authentication successful: {self.username}")
+        return True
+    
+    def perform_temp_dh(self):
+        """Perform temporary DH for authentication phase encryption."""
+        # Receive DH_CLIENT
+        msg = receive_message(self.client_socket)
+        if not msg:
+            return False
+        
+        dh_client_msg = ProtocolMessage.parse(msg)
+        if dh_client_msg['type'] != ProtocolMessage.TYPE_DH_CLIENT:
+            return False
+        
+        # Extract parameters
+        g = dh_client_msg['g']
+        p = dh_client_msg['p']
+        A = dh_client_msg['A']
+        
+        print(f"    Received: g={g}, p_bits={p.bit_length()}, A_bits={A.bit_length()}")
+        
+        # Create responder DH
+        dh = DHKeyExchange.create_responder(p, g)
+        B = dh.public_key
+        
+        # Compute shared secret and derive key
+        dh.compute_shared_secret(A)
+        temp_key = dh.derive_session_key()
+        self.temp_cipher = AESCipher(temp_key)
+        
+        # Send DH_SERVER
+        dh_server_msg = ProtocolMessage.create_dh_server(B)
+        send_message(self.client_socket, dh_server_msg)
+        
+        print(f"    Sent: B_bits={B.bit_length()}")
+        print("[✓] Temporary session key established")
+        
+        return True
+    
+    def handle_registration(self, reg_msg):
+        """Handle user registration."""
+        print("\n[*] Processing registration request...")
+        
+        email = reg_msg['email']
+        username = reg_msg['username']
+        password = reg_msg['password']  # Plaintext over encrypted channel
+        
+        print(f"    Email: {email}")
+        print(f"    Username: {username}")
+        
+        # Register user (database will hash the password)
+        success, message = self.db.register_user(email, username, password)
+        
+        if success:
+            self.username = username
+        
+        return success, message
+    
+    def handle_login(self, login_msg):
+        """Handle user login."""
+        print("\n[*] Processing login request...")
+        
+        email = login_msg['email']
+        password = login_msg['password']  # Plaintext over encrypted channel
+        
+        print(f"    Email: {email}")
+        
+        # Authenticate user
+        success, username_or_msg = self.db.authenticate_user(email, password)
+        
+        if success:
+            self.username = username_or_msg
+            return True, "Login successful"
+        else:
+            return False, username_or_msg
+    
+    def handle_key_agreement(self):
+        """Handle DH key agreement for session."""
+        print("\n" + "="*60)
+        print("PHASE 2: Key Agreement (Session Key Establishment)")
+        print("="*60)
+        
+        # Receive DH_CLIENT for session
+        print("\n[*] Waiting for DH parameters...")
+        msg = receive_message(self.client_socket)
+        if not msg:
+            return False
+        
+        dh_msg = ProtocolMessage.parse(msg)
+        if dh_msg['type'] != ProtocolMessage.TYPE_DH_CLIENT:
+            return False
+        
+        g = dh_msg['g']
+        p = dh_msg['p']
+        A = dh_msg['A']
+        
+        print(f"[✓] Received DH parameters")
+        print(f"    g = {g}")
+        print(f"    p = {p.bit_length()} bits")
+        print(f"    A = {A.bit_length()} bits")
+        
+        # Create responder
+        print("[*] Computing server DH values...")
+        dh = DHKeyExchange.create_responder(p, g)
+        B = dh.public_key
+        
+        # Compute shared secret
+        dh.compute_shared_secret(A)
+        self.session_key = dh.derive_session_key()
+        self.cipher = AESCipher(self.session_key)
+        
+        # Send response
+        print("[*] Sending DH response...")
+        dh_response = ProtocolMessage.create_dh_server(B)
+        send_message(self.client_socket, dh_response)
+        
+        print(f"[✓] Session key established")
+        print(f"    Key (hex): {self.session_key.hex()[:32]}...")
+        
+        # Initialize transcript
+        transcript_file = create_transcript_path("server", self.username)
+        self.transcript = TranscriptLogger(transcript_file, "server")
+        
+        return True
+    
+    def handle_chat_session(self):
+        """Handle encrypted chat session."""
+        print("\n" + "="*60)
+        print("PHASE 3: Data Plane (Encrypted Chat)")
+        print("="*60 + "\n")
+        
+        import select
+        
         while True:
-            sock, addr = srv.accept()
-            print(f"\n[*] Connection from {addr}")
             try:
-                client_cert_pem = exchange_and_verify_certs(sock)
-                aes_key = perform_dh(sock, client_cert_pem)
+                # Use select to check both socket and stdin
+                readable, _, _ = select.select([self.client_socket, sys.stdin], [], [], 0.1)
+                
+                for source in readable:
+                    if source == self.client_socket:
+                        # Receive message from client
+                        if not self.receive_chat_message():
+                            return
+                    
+                    elif source == sys.stdin:
+                        # Send message to client
+                        message = sys.stdin.readline().strip()
+                        if message:
+                            if message.lower() == '/quit':
+                                print("[*] Ending chat session...")
+                                return
+                            self.send_chat_message(message)
+            except KeyboardInterrupt:
+                print("\n[*] Chat interrupted. Ending session...")
+                return
+    
+    def send_chat_message(self, plaintext):
+        """Send encrypted and signed chat message."""
+        # Increment sequence number
+        self.seqno_sent += 1
+        
+        # Encrypt message
+        iv, ciphertext = self.cipher.encrypt(plaintext)
+        ct_with_iv = iv + ciphertext
+        ct_b64 = b64e(ct_with_iv)
+        
+        # Create signature
+        from app.common.utils import now_ms
+        timestamp = now_ms()
+        sig_b64 = SignatureManager.create_message_signature(
+            self.seqno_sent,
+            timestamp,
+            ct_with_iv,
+            self.pki.entity_private_key
+        )
+        
+        # Create message
+        msg = ProtocolMessage.create_chat_message(self.seqno_sent, ct_b64, sig_b64, timestamp)
+        send_message(self.client_socket, msg)
+        
+        # Log to transcript
+        peer_fingerprint = self.pki.get_certificate_fingerprint(self.peer_cert)
+        self.transcript.log_message(
+            self.seqno_sent,
+            timestamp,
+            ct_b64,
+            sig_b64,
+            peer_fingerprint
+        )
+        
+        print(f"[Server] {plaintext}")
+    
+    def receive_chat_message(self):
+        """Receive and verify encrypted chat message."""
+        msg_json = receive_message(self.client_socket)
+        if not msg_json:
+            return False
+        
+        try:
+            msg = ProtocolMessage.parse(msg_json)
+            
+            if msg['type'] == ProtocolMessage.TYPE_DISCONNECT:
+                print("\n[*] Client disconnected")
+                return False
+            
+            if msg['type'] != ProtocolMessage.TYPE_MSG:
+                return True
+            
+            seqno = msg['seqno']
+            timestamp = msg['ts']
+            ct_b64 = msg['ct']
+            sig_b64 = msg['sig']
+            
+            # Check sequence number (replay protection)
+            if seqno <= self.seqno_received:
+                print(f"[✗] REPLAY: Received seqno {seqno}, expected > {self.seqno_received}")
+                self.send_error("REPLAY", "Message replay detected")
+                return False
+            
+            # Verify signature
+            ct_with_iv = b64d(ct_b64)
+            if not SignatureManager.verify_message_signature(
+                seqno,
+                timestamp,
+                ct_with_iv,
+                sig_b64,
+                self.peer_cert.public_key()
+            ):
+                print(f"[✗] SIG_FAIL: Signature verification failed")
+                self.send_error("SIG_FAIL", "Signature verification failed")
+                return False
+            
+            # Decrypt message
+            iv = ct_with_iv[:16]
+            ciphertext = ct_with_iv[16:]
+            plaintext = self.cipher.decrypt(iv, ciphertext)
+            
+            # Update sequence number
+            self.seqno_received = seqno
+            
+            # Log to transcript
+            peer_fingerprint = self.pki.get_certificate_fingerprint(self.peer_cert)
+            self.transcript.log_message(
+                seqno,
+                timestamp,
+                ct_b64,
+                sig_b64,
+                peer_fingerprint
+            )
+            
+            print(f"[Client] {plaintext.decode('utf-8')}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"[✗] Error processing message: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def handle_teardown(self):
+        """Handle session teardown and generate receipt."""
+        print("\n" + "="*60)
+        print("PHASE 4: Teardown (Non-Repudiation)")
+        print("="*60 + "\n")
+        
+        if self.transcript:
+            # Compute transcript hash
+            transcript_hash = self.transcript.compute_transcript_hash()
+            
+            print(f"[*] Session transcript: {self.transcript.get_message_count()} messages")
+            print(f"[*] Transcript hash: {transcript_hash[:32]}...")
+            
+            # Sign transcript hash
+            sig = SignatureManager.sign_digest(
+                bytes.fromhex(transcript_hash),
+                self.pki.entity_private_key
+            )
+            sig_b64 = SignatureManager.encode_signature(sig)
+            
+            # Create receipt
+            receipt = ProtocolMessage.create_receipt(
+                "server",
+                1,
+                max(self.seqno_sent, self.seqno_received),
+                transcript_hash,
+                sig_b64
+            )
+            
+            # Save receipt
+            receipt_file = self.transcript.filepath.replace('.txt', '_receipt.json')
+            with open(receipt_file, 'w') as f:
+                f.write(receipt)
+            
+            print(f"[✓] Session receipt saved: {receipt_file}")
+            
+            self.transcript.close()
+    
+    def send_error(self, error_code, message):
+        """Send error message to client."""
+        error_msg = ProtocolMessage.create_error(error_code, message)
+        send_message(self.client_socket, error_msg)
+    
+    def cleanup(self):
+        """Cleanup resources."""
+        if self.transcript:
+            self.transcript.close()
+        
+        if self.client_socket:
+            try:
+                self.client_socket.close()
+            except:
+                pass
+        
+        if self.socket:
+            try:
+                self.socket.close()
+            except:
+                pass
+        
+        if self.db:
+            self.db.disconnect()
+        
+        print("\n[✓] Server stopped")
 
-                client_email = None
-                while not client_email:
-                    msg = recv_json(sock)
-                    if not msg:
-                        break
-                    if msg.get("type") == "register":
-                        handle_register(sock, aes_key, db_conn)
-                    elif msg.get("type") == "login":
-                        client_email = handle_login(sock, aes_key, db_conn)
-                    else:
-                        send_json(sock, Error(type="error", msg="expected register/login"))
 
-                if not client_email:
-                    continue
-
-                session_key = session_dh(sock)
-                handle_chat(sock, session_key, client_email, client_cert_pem)
-
-            except Exception as e:
-                print("[!] Handler exception:", e)
-            finally:
-                try:
-                    sock.close()
-                except:
-                    pass
-
-    except KeyboardInterrupt:
-        print("\n[!] Shutting down")
-    finally:
-        srv.close()
-        db_conn.close()
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    server = SecureChatServer()
+    server.start()
