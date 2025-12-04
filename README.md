@@ -2,7 +2,7 @@
 
 **Assignment #2 - Information Security**  
 **Semester:** Fall 2025  
-**Student:** 22i-1138 - Abdullah Shakir
+**Student:** 22i-1194 - Messam Raza
 
 ## 📋 Table of Contents
 
@@ -649,9 +649,9 @@ INSERT INTO users (email, username, salt, pwd_hash) VALUES
 
 ## 👤 Author
 
-**Abdullah Shakir**  
-**Roll Number:** 22i-1138  
-**GitHub:** https://github.com/chaudaryAbdullah/Secure-Chat
+**Messam Raza**  
+**Roll Number:** 22i-1194  
+**GitHub:** https://github.com/messam-raza/securechat-skeleton.git
 
 ---
 
